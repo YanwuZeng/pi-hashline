@@ -230,7 +230,6 @@ export class Patcher {
 
   private parseSectionEdits(section: PatchSection): Edit[] {
     const result = parsePatch(section.text);
-    const result = parsePatch(section.text);
     return result.edits;
   }
 

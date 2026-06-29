@@ -289,31 +289,91 @@ function findFirstChangedLine(before: string, after: string): number | undefined
 
 // ── Public convenience API ──────────────────────────────────────────────────
 
-export function buildCompactDiffPreview(before: string, after: string): { preview: string; addedLines: number; removedLines: number } {
+/** Default context lines for diff preview. */
+const DEFAULT_CONTEXT = 3;
+/** Default max output lines for diff preview. */
+const DEFAULT_MAX_OUT = 80;
+
+export function buildCompactDiffPreview(
+  before: string,
+  after: string,
+  options?: { contextLines?: number; maxLines?: number },
+): { preview: string; addedLines: number; removedLines: number } {
+  const ctx = options?.contextLines ?? DEFAULT_CONTEXT;
+  const maxOut = options?.maxLines ?? DEFAULT_MAX_OUT;
   const beforeLines = before.split("\n");
   const afterLines = after.split("\n");
   let added = 0;
   let removed = 0;
-  const out: string[] = [];
-  const maxLen = Math.max(beforeLines.length, afterLines.length);
 
+  // Find all changed line indices
+  const maxLen = Math.max(beforeLines.length, afterLines.length);
+  const changedIndices = new Set<number>();
   for (let i = 0; i < maxLen; i++) {
-    if (i >= beforeLines.length) {
-      out.push(`+ ${afterLines[i]}`);
-      added++;
-    } else if (i >= afterLines.length) {
-      out.push(`- ${beforeLines[i]}`);
-      removed++;
-    } else if (beforeLines[i] !== afterLines[i]) {
-      out.push(`- ${beforeLines[i]}`);
-      out.push(`+ ${afterLines[i]}`);
-      added++;
-      removed++;
+    const b = i < beforeLines.length ? beforeLines[i] : undefined;
+    const a = i < afterLines.length ? afterLines[i] : undefined;
+    if (b !== a) {
+      changedIndices.add(i);
+    }
+  }
+  if (changedIndices.size === 0) {
+    return { preview: "(no changes)", addedLines: 0, removedLines: 0 };
+  }
+
+  // Collect context-window line indices: each change ± ctx lines
+  const displayIndices = new Set<number>();
+  for (const ci of changedIndices) {
+    for (let d = -ctx; d <= ctx; d++) {
+      const ni = ci + d;
+      if (ni >= 0 && ni < maxLen) displayIndices.add(ni);
     }
   }
 
+  // Sort and emit, with "…" separators for gaps > 1
+  const sorted = [...displayIndices].sort((a, b) => a - b);
+  const out: string[] = [];
+  let previous = -99;
+
+  for (const idx of sorted) {
+    if (idx > previous + 1) {
+      out.push("…");
+    }
+    previous = idx;
+
+    const b = idx < beforeLines.length ? beforeLines[idx] : undefined;
+    const a = idx < afterLines.length ? afterLines[idx] : undefined;
+
+    if (b === a) {
+      // Context line
+      out.push(` ${b}`);
+    } else if (b === undefined) {
+      // Added line
+      out.push(`+ ${a}`);
+      added++;
+    } else if (a === undefined) {
+      // Removed line
+      out.push(`- ${b}`);
+      removed++;
+    } else {
+      // Changed line
+      out.push(`- ${b}`);
+      out.push(`+ ${a}`);
+      added++;
+      removed++;
+    }
+
+    // Respect max output lines (rough limit)
+    if (out.length >= maxOut) {
+      out.push(`… (${maxLen - idx - 1} more lines)`);
+      break;
+    }
+  }
+
+  // Stats summary
+  const summary = `@@ ${removed} removal(s), ${added} addition(s) @@`;
+
   return {
-    preview: out.join("\n"),
+    preview: [summary, ...out].join("\n"),
     addedLines: added,
     removedLines: removed,
   };

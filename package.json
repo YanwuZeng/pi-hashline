@@ -1,6 +1,6 @@
 {
   "name": "pi-hashline",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "type": "module",
   "description": "Hashline-compatible read/edit tools for Pi coding agent.",
   "scripts": {

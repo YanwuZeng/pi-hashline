@@ -5,6 +5,7 @@ import { access, readFile, writeFile } from "node:fs/promises";
 import { Type } from "typebox";
 import { loadPromptGuidelines } from "./prompts.ts";
 import { resolvePath } from "./shared.ts";
+import { applyEdits, buildCompactDiffPreview } from "./apply.ts";
 import { parsePatch } from "./parser.ts";
 import { resolveBlockEdits, hasBlockEdit } from "./block.ts";
 import { computeFileHash, formatHashlineHeader, formatNumberedLine, HL_FILE_HASH_LENGTH } from "./format.ts";
@@ -13,6 +14,7 @@ import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from ".
 import { MismatchError } from "./mismatch.ts";
 import { recover } from "./recovery.ts";
 import type { BlockResolver } from "./types.ts";
+
 /** Accept Pi's native format: `{ edits: [{diff?}], path? }` or `{ diff, path? }` */
 const editSchema = Type.Object({
   diff: Type.Optional(
@@ -132,7 +134,7 @@ export function registerEditTool(pi: ExtensionAPI) {
             const newHash = await computeFileHash(recoveryResult.text);
             await snapshotStore.record(absolute, recoveryResult.text);
             const header = formatHashlineHeader(filePath, newHash);
-            const diffPreview = buildCompactDiffPreview(normalized, recoveryResult.text);
+            const diffPreview = buildCompactDiffPreview(normalized, recoveryResult.text, { contextLines: 3, maxLines: 60 });
             return {
               content: [{ type: "text", text: `${header}\n\nRecovery applied.\n\n${diffPreview.preview}` }],
               details: { path: filePath, edits: edits.length, fileHash: newHash, warnings: [...(recoveryResult.warnings ?? []), ...parseWarnings], displayDiff: diffPreview.preview },
@@ -188,14 +190,17 @@ export function registerEditTool(pi: ExtensionAPI) {
       const newHash = await computeFileHash(applyResult.text);
       await snapshotStore.record(absolute, applyResult.text);
       const header = formatHashlineHeader(filePath, newHash);
-      const diffPreview = buildCompactDiffPreview(normalized, applyResult.text);
-      const anchorOutput = buildChangedAnchorOutput(applyResult.text, applyResult.firstChangedLine);
+      const diffPreview = buildCompactDiffPreview(
+        normalized,
+        applyResult.text,
+        { contextLines: 3, maxLines: 60 },
+      );
       const allWarnings: string[] = [...blockWarnings, ...(applyResult.warnings ?? []), ...parseWarnings];
 
       return {
         content: [{
           type: "text",
-          text: [header, anchorOutput ? `\n${anchorOutput}` : "", allWarnings.length > 0 ? `\nWarnings:\n${allWarnings.join("\n")}` : "", `\n${diffPreview.preview}`].filter(Boolean).join(""),
+          text: [header, allWarnings.length > 0 ? `\nWarnings:\n${allWarnings.join("\n")}` : "", `\n${diffPreview.preview}`].filter(Boolean).join(""),
         }],
         details: {
           path: filePath, edits: edits.length, fileHash: newHash,
@@ -239,17 +244,6 @@ function extractAnchorLines(edits: any[]): number[] {
     if (edit.kind === "insert" && (edit.cursor?.kind === "before_anchor" || edit.cursor?.kind === "after_anchor")) lines.push(edit.cursor.anchor.line);
   }
   return lines;
-}
-
-function buildChangedAnchorOutput(text: string, firstChangedLine?: number): string {
-  if (!firstChangedLine) return "";
-  const lines = text.split("\n");
-  const start = Math.max(0, firstChangedLine - 1);
-  const end = Math.min(lines.length, start + 5);
-  const selected: string[] = [];
-  for (let i = start; i < end; i++) selected.push(formatNumberedLine(i + 1, lines[i]));
-  if (selected.length === 0) return "";
-  return `--- Changed lines ${start + 1}-${end} ---\n${selected.join("\n")}`;
 }
 
 function findChangedEnd(after: string, before: string): number {

@@ -371,11 +371,13 @@ test("regression: buildCompactDiffPreview should only show changed lines", () =>
 
   const { preview, addedLines, removedLines } = buildCompactDiffPreview(before, after);
 
-  // Should show -line2 and +line2_CHANGED
+  // Should show -line2 and +line2_CHANGED (with context lines ±3)
   assert.ok(preview.includes("- line2"), "Should show removed line 2");
   assert.ok(preview.includes("+ line2_CHANGED"), "Should show added line 2_CHANGED");
-  assert.ok(!preview.includes("line1"), "Should NOT show unchanged line 1");
-  assert.ok(!preview.includes("line5"), "Should NOT show unchanged line 5");
+  // Context lines appear with ' ' prefix and are shown within ±3 lines of changes
+  assert.ok(preview.includes(" line1"), "Should show context line 1");
+  // Stats header
+  assert.ok(preview.includes("@@"), "Should have stats summary header");
   assert.equal(addedLines, 1, "Should count 1 added line");
   assert.equal(removedLines, 1, "Should count 1 removed line");
 
@@ -401,6 +403,8 @@ test("regression: buildCompactDiffPreview added lines at end", () => {
 
   assert.ok(preview.includes("+ line3"), "Should show added line 3");
   assert.ok(preview.includes("+ line4"), "Should show added line 4");
+  // Context: line1 is within ±3 of line3
+  assert.ok(preview.includes(" line1"), "Should show context line 1");
   assert.equal(addedLines, 2, "Should count 2 added lines");
   assert.equal(removedLines, 0, "Should count 0 removed lines");
 
