@@ -1,0 +1,51 @@
+{
+  "name": "pi-hashline",
+  "version": "0.1.4",
+  "type": "module",
+  "description": "Hashline-compatible read/edit tools for Pi coding agent.",
+  "scripts": {
+    "test": "node --import @mariozechner/jiti/register --test test/*.test.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "author": "YanwuZeng",
+  "files": [
+    "assets/",
+    "index.ts",
+    "prompts/",
+    "src/"
+  ],
+  "dependencies": {
+    "diff": "^9.0.0",
+    "lru-cache": "^11.5.1",
+    "typebox": "^1.1.38",
+    "xxhash-wasm": "^1.1.0"
+  },
+  "devDependencies": {
+    "@mariozechner/jiti": "^2.6.5"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "hashline",
+    "anchored-edit"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YanwuZeng/pi-hashline.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YanwuZeng/pi-hashline/issues"
+  },
+  "homepage": "https://github.com/YanwuZeng/pi-hashline#readme"
+}
