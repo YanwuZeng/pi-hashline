@@ -147,8 +147,6 @@ export function registerEditTool(pi: ExtensionAPI) {
         }
       }
 
-      }
-
       // Resolve block edits
       let resolvedEdits = edits;
       const blockWarnings: string[] = [];
