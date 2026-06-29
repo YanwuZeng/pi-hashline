@@ -2,10 +2,20 @@ import type { Anchor, ApplyResult, Cursor, Edit } from "./types";
 
 type InsertEdit = Extract<Edit, { kind: "insert" }>;
 type DeleteEdit = Extract<Edit, { kind: "delete" }>;
-type AppliedEdit = InsertEdit | DeleteEdit;
 
-function trailingPhantomLine(fileLines: readonly string[]): number {
-  return fileLines.length > 1 && fileLines[fileLines.length - 1] === "" ? fileLines.length : 0;
+// ── Atomic operation types ─────────────────────────────────────────────────
+
+/** An atomic edit operation with its target line for bottom-up sorting. */
+interface AtomicOp {
+  kind: "replace" | "insert_before" | "insert_after" | "bof" | "eof" | "delete";
+  /** 1-indexed anchor line used for bottom-up sorting. 0 for bof, Infinity for eof. */
+  anchorLine: number;
+  /** Payload lines to insert. */
+  payload: string[];
+  /** Number of lines to delete (for replace and delete ops). */
+  deleteCount: number;
+  /** Stable sort tiebreaker (original index in the edit list). */
+  index: number;
 }
 
 // ── Landing-shift logic ────────────────────────────────────────────────────
@@ -23,13 +33,13 @@ function indentDepth(line: string): number {
   return count;
 }
 
-function adjustInsertAfterLanding(
-  edit: InsertEdit,
+function computeInsertAfterLanding(
+  anchorLine: number,
+  firstPayloadLine: string,
   fileLines: readonly string[],
 ): { landingLine: number; crossed: number } {
-  const anchorLine = edit.cursor.anchor.line;
   const anchorDepth = indentDepth(fileLines[anchorLine - 1] ?? "");
-  const bodyDepth = indentDepth(edit.text);
+  const bodyDepth = indentDepth(firstPayloadLine);
   if (bodyDepth >= anchorDepth) return { landingLine: anchorLine, crossed: 0 };
   let landingLine = anchorLine;
   let crossed = 0;
@@ -47,27 +57,29 @@ function adjustInsertAfterLanding(
   return { landingLine, crossed };
 }
 
-// ── Main apply function ────────────────────────────────────────────────────
+function trailingPhantomLine(fileLines: readonly string[]): number {
+  return fileLines.length > 1 && fileLines[fileLines.length - 1] === "" ? fileLines.length : 0;
+}
 
-export function applyEdits(oldText: string, edits: readonly Edit[]): ApplyResult {
-  const warnings: string[] = [];
-  let fileLines = oldText.split("\n");
+// ── Group edits into atomic operations ─────────────────────────────────────
 
-  // Separate block edits (must be resolved before calling this function)
-  const resolved: AppliedEdit[] = [];
-  for (const edit of edits) {
+/**
+ * Group a flat list of edits into atomic operations, preserving replacement
+ * groups (inserts + deletes) as single operations.
+ */
+function groupAtomicOps(edits: readonly Edit[]): AtomicOp[] {
+  const ops: AtomicOp[] = [];
+  let i = 0;
+
+  while (i < edits.length) {
+    const edit = edits[i];
+
+    // Block edits must be resolved before reaching the applier
     if (edit.kind === "block") {
       throw new Error("Unresolved block edit reached applier; run resolveBlockEdits first.");
     }
-    resolved.push(edit as AppliedEdit);
-  }
 
-  // Process in order: group replacement inserts + deletes atomically
-  let i = 0;
-  while (i < resolved.length) {
-    const edit = resolved[i];
-
-    // Check if this is the start of a replacement group
+    // ── Replacement group: consecutive "replacement" inserts + consecutive deletes ──
     if (
       edit.kind === "insert" &&
       edit.mode === "replacement" &&
@@ -78,14 +90,14 @@ export function applyEdits(oldText: string, edits: readonly Edit[]): ApplyResult
       const payload: string[] = [];
       let insertEnd = i;
       while (
-        insertEnd < resolved.length &&
-        resolved[insertEnd].kind === "insert" &&
-        resolved[insertEnd].mode === "replacement" &&
-        resolved[insertEnd].cursor.kind === "before_anchor" &&
-        resolved[insertEnd].cursor.anchor.line === anchorLine &&
-        resolved[insertEnd].lineNum === sourceLineNum
+        insertEnd < edits.length &&
+        edits[insertEnd].kind === "insert" &&
+        edits[insertEnd].mode === "replacement" &&
+        edits[insertEnd].cursor.kind === "before_anchor" &&
+        edits[insertEnd].cursor.anchor.line === anchorLine &&
+        edits[insertEnd].lineNum === sourceLineNum
       ) {
-        payload.push(resolved[insertEnd].text);
+        payload.push((edits[insertEnd] as InsertEdit).text);
         insertEnd++;
       }
 
@@ -94,74 +106,165 @@ export function applyEdits(oldText: string, edits: readonly Edit[]): ApplyResult
       let expectedLine = anchorLine;
       let deleteEnd = insertEnd;
       while (
-        deleteEnd < resolved.length &&
-        resolved[deleteEnd].kind === "delete" &&
-        resolved[deleteEnd].anchor.line === expectedLine &&
-        resolved[deleteEnd].lineNum === sourceLineNum
+        deleteEnd < edits.length &&
+        edits[deleteEnd].kind === "delete" &&
+        edits[deleteEnd].anchor.line === expectedLine &&
+        edits[deleteEnd].lineNum === sourceLineNum
       ) {
-        deleteEdits.push(resolved[deleteEnd]);
+        deleteEdits.push(edits[deleteEnd] as DeleteEdit);
         expectedLine++;
         deleteEnd++;
       }
 
-      if (deleteEdits.length > 0) {
-        // Replace: delete original range, then insert payload
-        const deleteStart = anchorLine - 1;
-        const deleteCount = deleteEdits.length;
-        fileLines.splice(deleteStart, deleteCount, ...payload);
-      } else {
-        // Only inserts without matching deletes — treat as regular insert
-        const idx = anchorLine - 1;
-        fileLines.splice(idx, 0, ...payload);
-      }
-
+      ops.push({
+        kind: "replace",
+        anchorLine,
+        payload,
+        deleteCount: deleteEdits.length,
+        index: edit.index,
+      });
       i = deleteEnd;
       continue;
     }
 
-    // Handle non-replacement inserts
+    // ── Individual insert ──
     if (edit.kind === "insert") {
-      const text = edit.text;
       const cursor = edit.cursor;
-
       if (cursor.kind === "bof") {
-        if (fileLines.length === 1 && fileLines[0] === "") {
-          fileLines = [text];
-        } else {
-          fileLines.splice(0, 0, text);
-        }
+        ops.push({ kind: "bof", anchorLine: 0, payload: [edit.text], deleteCount: 0, index: edit.index });
       } else if (cursor.kind === "eof") {
-        const hasTrailingNewline = fileLines.length > 0 && fileLines[fileLines.length - 1] === "";
-        const idx = hasTrailingNewline ? fileLines.length - 1 : fileLines.length;
-        fileLines.splice(idx, 0, text);
+        ops.push({ kind: "eof", anchorLine: Infinity, payload: [edit.text], deleteCount: 0, index: edit.index });
       } else if (cursor.kind === "before_anchor") {
-        const idx = cursor.anchor.line - 1;
-        fileLines.splice(idx, 0, text);
+        ops.push({ kind: "insert_before", anchorLine: cursor.anchor.line, payload: [edit.text], deleteCount: 0, index: edit.index });
       } else if (cursor.kind === "after_anchor") {
-        const { landingLine, crossed } = adjustInsertAfterLanding(edit, fileLines);
-        if (crossed > 0) {
-          warnings.push(
-            `INS.POST ${cursor.anchor.line}: landing shifted from line ${cursor.anchor.line} to ${landingLine} (${crossed} closer${crossed === 1 ? "" : "s"} skipped)`,
-          );
-        }
-        fileLines.splice(landingLine, 0, text);
+        ops.push({ kind: "insert_after", anchorLine: cursor.anchor.line, payload: [edit.text], deleteCount: 0, index: edit.index });
       }
       i++;
       continue;
     }
 
-    // Handle deletes (standalone)
+    // ── Standalone delete ──
     if (edit.kind === "delete") {
-      const idx = edit.anchor.line - 1;
-      const phantomLine = trailingPhantomLine(fileLines);
-      if (idx !== phantomLine && idx >= 0 && idx < fileLines.length) {
-        fileLines.splice(idx, 1);
-      }
+      ops.push({ kind: "delete", anchorLine: edit.anchor.line, payload: [], deleteCount: 1, index: edit.index });
       i++;
       continue;
     }
 
     i++;
+  }
+
+  return ops;
+}
+
+/**
+ * Merge consecutive atomic operations that share the same anchor and kind,
+ * batching their payloads together. This ensures multiple INS.POST payload
+ * lines at the same anchor are inserted in one splice call, preventing
+ * the duplication bug seen when inserting each line individually.
+ */
+function mergeConsecutiveOps(ops: AtomicOp[]): AtomicOp[] {
+  if (ops.length === 0) return ops;
+  const merged: AtomicOp[] = [];
+  let current = ops[0];
+
+  for (let i = 1; i < ops.length; i++) {
+    const next = ops[i];
+    const sameKind = current.kind === next.kind;
+    const sameAnchor =
+      current.anchorLine === next.anchorLine &&
+      (current.kind === "insert_after" || current.kind === "insert_before" || current.kind === "bof" || current.kind === "eof");
+    if (sameKind && sameAnchor) {
+      // Merge payloads; keep the lower index for stability
+      current = { ...current, payload: [...current.payload, ...next.payload], index: Math.min(current.index, next.index) };
+    } else {
+      merged.push(current);
+      current = next;
+    }
+  }
+  merged.push(current);
+  return merged;
+}
+
+// ── Main apply function ────────────────────────────────────────────────────
+
+export function applyEdits(oldText: string, edits: readonly Edit[]): ApplyResult {
+  // Step 1: Group edits into atomic operations
+  let ops = groupAtomicOps(edits);
+
+  // Step 2: Merge consecutive same-anchor insert ops (batch payloads)
+  ops = mergeConsecutiveOps(ops);
+
+  // Step 3: Sort operations bottom-up (descending anchorLine) with stable tiebreaker.
+  // Bottom-up processing prevents line-number drift: edits at higher line numbers
+  // are applied first, so they don't shift the positions of lower-line edits.
+  ops.sort((a, b) => {
+    if (b.anchorLine !== a.anchorLine) return b.anchorLine - a.anchorLine;
+    return a.index - b.index;
+  });
+
+  // Step 4: Apply each operation against the file
+  const warnings: string[] = [];
+  let fileLines = oldText.split("\n");
+
+  for (const op of ops) {
+    switch (op.kind) {
+      case "replace": {
+        const deleteStart = op.anchorLine - 1;
+        if (op.deleteCount > 0) {
+          fileLines.splice(deleteStart, op.deleteCount, ...op.payload);
+        } else {
+          // No deletes — treat as insert before
+          fileLines.splice(deleteStart, 0, ...op.payload);
+        }
+        break;
+      }
+
+      case "insert_before": {
+        const idx = op.anchorLine - 1;
+        fileLines.splice(idx, 0, ...op.payload);
+        break;
+      }
+
+      case "insert_after": {
+        const { landingLine, crossed } = computeInsertAfterLanding(
+          op.anchorLine,
+          op.payload[0] ?? "",
+          fileLines,
+        );
+        if (crossed > 0) {
+          warnings.push(
+            `INS.POST ${op.anchorLine}: landing shifted from line ${op.anchorLine} to ${landingLine} (${crossed} closer${crossed === 1 ? "" : "s"} skipped)`,
+          );
+        }
+        fileLines.splice(landingLine, 0, ...op.payload);
+        break;
+      }
+
+      case "bof": {
+        if (fileLines.length === 1 && fileLines[0] === "") {
+          fileLines = [...op.payload];
+        } else {
+          fileLines.splice(0, 0, ...op.payload);
+        }
+        break;
+      }
+
+      case "eof": {
+        const hasTrailingNewline = fileLines.length > 0 && fileLines[fileLines.length - 1] === "";
+        const idx = hasTrailingNewline ? fileLines.length - 1 : fileLines.length;
+        fileLines.splice(idx, 0, ...op.payload);
+        break;
+      }
+
+      case "delete": {
+        const idx = op.anchorLine - 1;
+        const phantomLine = trailingPhantomLine(fileLines);
+        if (idx !== phantomLine && idx >= 0 && idx < fileLines.length) {
+          fileLines.splice(idx, op.deleteCount);
+        }
+        break;
+      }
+    }
   }
 
   const result = fileLines.join("\n");
@@ -191,26 +294,26 @@ export function buildCompactDiffPreview(before: string, after: string): { previe
   const afterLines = after.split("\n");
   let added = 0;
   let removed = 0;
-  const lines: string[] = [];
+  const out: string[] = [];
   const maxLen = Math.max(beforeLines.length, afterLines.length);
 
   for (let i = 0; i < maxLen; i++) {
     if (i >= beforeLines.length) {
-      lines.push(`+ ${afterLines[i]}`);
+      out.push(`+ ${afterLines[i]}`);
       added++;
     } else if (i >= afterLines.length) {
-      lines.push(`- ${beforeLines[i]}`);
+      out.push(`- ${beforeLines[i]}`);
       removed++;
     } else if (beforeLines[i] !== afterLines[i]) {
-      lines.push(`- ${beforeLines[i]}`);
-      lines.push(`+ ${afterLines[i]}`);
+      out.push(`- ${beforeLines[i]}`);
+      out.push(`+ ${afterLines[i]}`);
       added++;
       removed++;
     }
   }
 
   return {
-    preview: lines.join("\n"),
+    preview: out.join("\n"),
     addedLines: added,
     removedLines: removed,
   };

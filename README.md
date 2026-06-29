@@ -155,6 +155,41 @@ Project layout:
 
 This project is based on [Fadouse/pi-hash-anchored-edit](https://github.com/Fadouse/pi-hash-anchored-edit) and adopts the hashline syntax from [can1357/oh-my-pi](https://github.com/can1357/oh-my-pi) (packages/hashline).
 
+
+
+## Changelog
+
+### 0.1.5 (2026-06-29)
+
+**Bug fixes & robustness improvements:**
+
+1. **Fix: #TAG stripped from file path** — edit no longer treats the 4-hex snapshot
+   tag as part of the filename. The tag is properly extracted from [path#TAG] for hash validation,
+   while the real file path is used for filesystem access.
+
+2. **Fix: Line-number drift with multiple hunks** — applyEdits now groups edits
+   into atomic operations and processes them bottom-up (descending line number). This prevents
+   earlier edits from shifting the line positions that later edits depend on.
+
+3. **Fix: INS.POST content duplication** — Multiple payload lines inserted after the
+   same anchor are now batched into a single splice call.
+
+4. **Improved diff output** — buildCompactDiffPreview compares line-by-line and only shows
+   lines that actually changed (- old / + new). Unchanged lines are omitted.
+
+**New regression tests (11 cases):**
+   - Multi-hunk SWAP line-drift verification
+   - INS.POST with multiple payload lines (no duplication check)
+   - SWAP range shrinking/expanding
+   - Mixed SWAP + INS.POST + DEL operations
+   - INS.POST landing-shift with structural closers
+   - SWAP ranges containing closing braces
+   - buildCompactDiffPreview correctness
+   - Multiple interleaved operations on nearby lines
+
+All 34 tests pass (23 original + 11 regression).
+
+
 ## License
 
 MIT

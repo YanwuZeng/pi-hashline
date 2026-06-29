@@ -7,14 +7,12 @@ import { loadPromptGuidelines } from "./prompts.ts";
 import { resolvePath } from "./shared.ts";
 import { parsePatch } from "./parser.ts";
 import { resolveBlockEdits, hasBlockEdit } from "./block.ts";
-import { applyEdits, buildCompactDiffPreview } from "./apply.ts";
-import { computeFileHash, formatHashlineHeader, formatNumberedLine } from "./format.ts";
+import { computeFileHash, formatHashlineHeader, formatNumberedLine, HL_FILE_HASH_LENGTH } from "./format.ts";
 import { snapshotStore } from "./read.ts";
 import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "./normalize.ts";
 import { MismatchError } from "./mismatch.ts";
 import { recover } from "./recovery.ts";
 import type { BlockResolver } from "./types.ts";
-
 /** Accept Pi's native format: `{ edits: [{diff?}], path? }` or `{ diff, path? }` */
 const editSchema = Type.Object({
   diff: Type.Optional(
@@ -77,9 +75,25 @@ export function registerEditTool(pi: ExtensionAPI) {
 
       let pathOverride = params.path as string | undefined;
 
-      // Extract path from [path#TAG] header if present
+      // Extract path from [path#TAG] header.
+      // NOTE: headerMatch[1] captures everything inside [brackets], including #TAG suffix.
+      // We MUST strip the #TAG to get the real file path, and use it separately for hash validation.
       const headerMatch = diffText.match(/^\[([^\]]+)\]/m);
-      const filePath = pathOverride || (headerMatch ? headerMatch[1] : null);
+      let rawPathFromHeader: string | undefined;
+      let headerHash: string | undefined;
+      if (headerMatch) {
+        const inner = headerMatch[1];
+        // Try to extract #XXXX tag at the end
+        const hashTagMatch = inner.match(new RegExp(`#([0-9A-Fa-f]{${HL_FILE_HASH_LENGTH}})\\s*$`));
+        if (hashTagMatch) {
+          headerHash = hashTagMatch[1].toUpperCase();
+          rawPathFromHeader = inner.slice(0, hashTagMatch.index);
+        } else {
+          // No valid tag found, use entire inner as path
+          rawPathFromHeader = inner;
+        }
+      }
+      const filePath = pathOverride || rawPathFromHeader;
       if (!filePath) {
         throw new Error(
           "No file path specified. Include `[path#TAG]` header in the diff, or pass `path` parameter.",
@@ -104,36 +118,35 @@ export function registerEditTool(pi: ExtensionAPI) {
         };
       }
 
-      // Validate file hash if present in the diff header
-      if (headerMatch) {
-        const headerHashMatch = headerMatch[1].match(/#([0-9A-F]{4})$/);
-        if (headerHashMatch) {
-          const expectedHash = headerHashMatch[1];
-          if (liveHash !== expectedHash) {
-            const recoveryResult = await recover(snapshotStore, {
-              path: absolute, currentText: normalized, fileHash: expectedHash, edits,
-            });
-            if (recoveryResult) {
-              const resultText = restoreLineEndings(recoveryResult.text, eol);
-              const persisted = bom + resultText;
-              await writeFile(absolute, persisted, "utf8");
-              const newHash = await computeFileHash(recoveryResult.text);
-              await snapshotStore.record(absolute, recoveryResult.text);
-              const header = formatHashlineHeader(filePath, newHash);
-              const diffPreview = buildCompactDiffPreview(normalized, recoveryResult.text);
-              return {
-                content: [{ type: "text", text: `${header}\n\nRecovery applied.\n\n${diffPreview.preview}` }],
-                details: { path: filePath, edits: edits.length, fileHash: newHash, warnings: [...(recoveryResult.warnings ?? []), ...parseWarnings], displayDiff: diffPreview.preview },
-              };
-            }
-            const fileLines = normalized.split("\n");
-            throw new MismatchError({
-              path: filePath, expectedFileHash: expectedHash, actualFileHash: liveHash,
-              fileLines, anchorLines: extractAnchorLines(edits),
-              hashRecognized: snapshotStore.byHash(absolute, expectedHash) !== null,
-            });
+      // Validate file hash if present in the diff header (pre-extracted during path parsing)
+      if (headerMatch && headerHash) {
+        const expectedHash = headerHash;
+        if (liveHash !== expectedHash) {
+          const recoveryResult = await recover(snapshotStore, {
+            path: absolute, currentText: normalized, fileHash: expectedHash, edits,
+          });
+          if (recoveryResult) {
+            const resultText = restoreLineEndings(recoveryResult.text, eol);
+            const persisted = bom + resultText;
+            await writeFile(absolute, persisted, "utf8");
+            const newHash = await computeFileHash(recoveryResult.text);
+            await snapshotStore.record(absolute, recoveryResult.text);
+            const header = formatHashlineHeader(filePath, newHash);
+            const diffPreview = buildCompactDiffPreview(normalized, recoveryResult.text);
+            return {
+              content: [{ type: "text", text: `${header}\n\nRecovery applied.\n\n${diffPreview.preview}` }],
+              details: { path: filePath, edits: edits.length, fileHash: newHash, warnings: [...(recoveryResult.warnings ?? []), ...parseWarnings], displayDiff: diffPreview.preview },
+            };
           }
+          const fileLines = normalized.split("\n");
+          throw new MismatchError({
+            path: filePath, expectedFileHash: expectedHash, actualFileHash: liveHash,
+            fileLines, anchorLines: extractAnchorLines(edits),
+            hashRecognized: snapshotStore.byHash(absolute, expectedHash) !== null,
+          });
         }
+      }
+
       }
 
       // Resolve block edits
