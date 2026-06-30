@@ -1,26 +1,27 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Container, Spacer, Text } from "@mariozechner/pi-tui";
-import { constants } from "node:fs";
-import { access, readFile, writeFile } from "node:fs/promises";
 import { Type } from "typebox";
 import { loadPromptGuidelines } from "./prompts.ts";
-import { resolvePath } from "./shared.ts";
-import { applyEdits, buildCompactDiffPreview } from "./apply.ts";
-import { parsePatch } from "./parser.ts";
-import { resolveBlockEdits, hasBlockEdit } from "./block.ts";
-import { computeFileHash, formatHashlineHeader, formatNumberedLine, HL_FILE_HASH_LENGTH } from "./format.ts";
+import { buildCompactDiffPreview } from "./apply.ts";
+import { Patch } from "./input.ts";
+import { Patcher } from "./patcher.ts";
+import { NodeFilesystem } from "./fs.ts";
 import { snapshotStore } from "./read.ts";
-import { detectLineEnding, normalizeToLF, restoreLineEndings, stripBom } from "./normalize.ts";
-import { MismatchError } from "./mismatch.ts";
-import { recover } from "./recovery.ts";
-import type { BlockResolver } from "./types.ts";
+import { computeFileHash, formatHashlineHeader } from "./format.ts";
+import { NoopLoopGuard, payloadKeyHash } from "./noop-loop-guard.ts";
+import { createBraceBlockResolver } from "./block-resolver.ts";
 
-/** Accept Pi's native format: `{ edits: [{diff?}], path? }` or `{ diff, path? }` */
+/**
+ * Accept Pi's native format: `{ edits: [{diff?}], path? }` or `{ diff, path? }`.
+ * The `diff` string IS the hashline DSL text (`[path#TAG]` header + ops + `+TEXT`
+ * body rows). `edits` is accepted for compatibility with Pi's native edit
+ * dispatch and is reduced to its first element's `diff`/`text` string.
+ */
 const editSchema = Type.Object({
   diff: Type.Optional(
     Type.String({
       description:
-        "Hashline-format diff text. Must start with `[PATH#TAG]` file header, followed by hunk headers and `+TEXT` body rows.",
+        "Hashline-format diff text. Must start with a `[PATH#TAG]` file header, followed by hunk headers and `+TEXT` body rows.",
     }),
   ),
   edits: Type.Optional(
@@ -35,14 +36,15 @@ const editSchema = Type.Object({
   ),
 });
 
-const blockResolver: BlockResolver | undefined = undefined;
+/** Module-level guard persists across tool calls to break fixation loops. */
+const noopGuard = new NoopLoopGuard();
 
 export function registerEditTool(pi: ExtensionAPI) {
   pi.registerTool({
     name: "edit",
     label: "edit#",
     description:
-      "Edit a text file using hashline-format diff text. Format: `[path#TAG]` header + `SWAP`/`DEL`/`INS` ops with `+TEXT` body rows.",
+      "Edit a text file using hashline-format diff text. Format: `[path#TAG]` header + `SWAP`/`DEL`/`INS` ops with `+TEXT` body rows. Multi-file diffs are applied all-or-nothing.",
     promptSnippet: "Make hashline-format edits using anchors from read",
     promptGuidelines: loadPromptGuidelines("edit.md"),
     parameters: editSchema,
@@ -72,140 +74,79 @@ export function registerEditTool(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       if (signal?.aborted) throw new Error("Operation aborted");
 
-      let diffText = params.diff as string;
-      if (!diffText) throw new Error("No hashline diff text provided. Pass a `diff` string in hashline format.");
+      const diffText = params.diff as string;
+      if (!diffText) {
+        throw new Error("No hashline diff text provided. Pass a `diff` string in hashline format.");
+      }
 
-      let pathOverride = params.path as string | undefined;
+      const cwd = ctx?.cwd ?? process.cwd();
+      let patch = new Patch(diffText, cwd);
 
-      // Extract path from [path#TAG] header.
-      // NOTE: headerMatch[1] captures everything inside [brackets], including #TAG suffix.
-      // We MUST strip the #TAG to get the real file path, and use it separately for hash validation.
-      const headerMatch = diffText.match(/^\[([^\]]+)\]/m);
-      let rawPathFromHeader: string | undefined;
-      let headerHash: string | undefined;
-      if (headerMatch) {
-        const inner = headerMatch[1];
-        // Try to extract #XXXX tag at the end
-        const hashTagMatch = inner.match(new RegExp(`#([0-9A-Fa-f]{${HL_FILE_HASH_LENGTH}})\\s*$`));
-        if (hashTagMatch) {
-          headerHash = hashTagMatch[1].toUpperCase();
-          rawPathFromHeader = inner.slice(0, hashTagMatch.index);
+      // Support an explicit `path` override when the diff lacks a header.
+      if (patch.sections.length === 0) {
+        const pathOverride = typeof params.path === "string" ? params.path : undefined;
+        if (pathOverride) {
+          patch = new Patch(`[${pathOverride}]\n${diffText}`, cwd);
         } else {
-          // No valid tag found, use entire inner as path
-          rawPathFromHeader = inner;
-        }
-      }
-      const filePath = pathOverride || rawPathFromHeader;
-      if (!filePath) {
-        throw new Error(
-          "No file path specified. Include `[path#TAG]` header in the diff, or pass `path` parameter.",
-        );
-      }
-
-      const absolute = resolvePath(filePath, ctx?.cwd ?? process.cwd());
-      await access(absolute, constants.R_OK | constants.W_OK);
-      const raw = await readFile(absolute, "utf8");
-
-      const { bom, text: bomStripped } = stripBom(raw);
-      const eol = detectLineEnding(bomStripped);
-      const normalized = normalizeToLF(bomStripped);
-      const liveHash = await computeFileHash(normalized);
-
-      // Parse the hashline diff
-      const { edits, warnings: parseWarnings } = parsePatch(diffText);
-      if (edits.length === 0) {
-        return {
-          content: [{ type: "text", text: "No edits produced from the diff text." }],
-          details: { path: filePath, edits: 0 },
-        };
-      }
-
-      // Validate file hash if present in the diff header (pre-extracted during path parsing)
-      if (headerMatch && headerHash) {
-        const expectedHash = headerHash;
-        if (liveHash !== expectedHash) {
-          const recoveryResult = await recover(snapshotStore, {
-            path: absolute, currentText: normalized, fileHash: expectedHash, edits,
-          });
-          if (recoveryResult) {
-            const resultText = restoreLineEndings(recoveryResult.text, eol);
-            const persisted = bom + resultText;
-            await writeFile(absolute, persisted, "utf8");
-            const newHash = await computeFileHash(recoveryResult.text);
-            await snapshotStore.record(absolute, recoveryResult.text);
-            const header = formatHashlineHeader(filePath, newHash);
-            const diffPreview = buildCompactDiffPreview(normalized, recoveryResult.text, { contextLines: 3, maxLines: 60 });
-            return {
-              content: [{ type: "text", text: `${header}\n\nRecovery applied.\n\n${diffPreview.preview}` }],
-              details: { path: filePath, edits: edits.length, fileHash: newHash, warnings: [...(recoveryResult.warnings ?? []), ...parseWarnings], displayDiff: diffPreview.preview },
-            };
-          }
-          const fileLines = normalized.split("\n");
-          throw new MismatchError({
-            path: filePath, expectedFileHash: expectedHash, actualFileHash: liveHash,
-            fileLines, anchorLines: extractAnchorLines(edits),
-            hashRecognized: snapshotStore.byHash(absolute, expectedHash) !== null,
-          });
+          throw new Error(
+            "No `[path#TAG]` header found in the diff text. Include a file header from your latest read, or pass a `path` parameter.",
+          );
         }
       }
 
-      // Resolve block edits
-      let resolvedEdits = edits;
-      const blockWarnings: string[] = [];
-      if (hasBlockEdit(edits)) {
-        if (!blockResolver) {
-          const lowered: typeof edits = [];
-          for (const edit of edits) {
-            if (edit.kind === "block" && edit.mode === "insert_after") {
-              for (const payload of edit.payloads) {
-                lowered.push({
-                  kind: "insert",
-                  cursor: { kind: "after_anchor", anchor: { line: edit.anchor.line } },
-                  text: payload, lineNum: edit.lineNum, index: lowered.length,
-                });
-              }
-              blockWarnings.push(
-                `INS.BLK.POST ${edit.anchor.line}: no block resolver, applied as INS.POST ${edit.anchor.line}:`,
-              );
-            } else if (edit.kind === "block") {
-              throw new Error(`SWAP.BLK/DEL.BLK not available. Use concrete line ranges.`);
-            } else {
-              lowered.push(edit);
-            }
-          }
-          resolvedEdits = lowered;
-        } else {
-          resolvedEdits = resolveBlockEdits(edits, normalized, absolute, blockResolver, {
-            onWarning: (msg) => { blockWarnings.push(msg); },
-          });
+      // Single pipeline: Patcher handles BOM/EOL, tag validation, seen-lines,
+      // HEAD/TAIL drift, stale-tag recovery, block resolution, all-or-nothing
+      // apply, and fresh-tag minting. edit.ts only formats the result.
+      const patcher = new Patcher({
+        fs: new NodeFilesystem(),
+        snapshots: snapshotStore,
+        blockResolver: createBraceBlockResolver(),
+      });
+
+      const result = await patcher.apply(patch);
+
+      const contentParts: string[] = [];
+      const allWarnings: string[] = [];
+      let firstDisplayDiff: string | undefined;
+      let firstFileHash: string | undefined;
+      let firstPath: string | undefined;
+
+      for (let idx = 0; idx < result.sections.length; idx++) {
+        const s = result.sections[idx];
+        const section = patch.sections[idx];
+        const isNoop = s.op === "noop";
+
+        // Noop-loop guard: keyed on (canonicalPath, payload) so a genuine new
+        // edit resets the counter while a repeated no-op eventually hard-fails.
+        noopGuard.observe(`${s.canonicalPath}::${payloadKeyHash(section.text)}`, isNoop);
+
+        if (s.warnings.length > 0) allWarnings.push(...s.warnings);
+
+        if (isNoop) {
+          const noopHeader = s.header || formatHashlineHeader(s.path, await computeFileHash(s.before));
+          contentParts.push(
+            `${noopHeader}\n\nNo changes — the anchors already match the current file content.`,
+          );
+          continue;
         }
+
+        const preview = buildCompactDiffPreview(s.before, s.after, { contextLines: 3, maxLines: 60 });
+        if (firstDisplayDiff === undefined) firstDisplayDiff = preview.preview;
+        if (firstFileHash === undefined) firstFileHash = s.fileHash;
+        if (firstPath === undefined) firstPath = s.path;
+
+        const warns = s.warnings.length > 0 ? `\nWarnings:\n${s.warnings.join("\n")}` : "";
+        contentParts.push([s.header, warns, `\n${preview.preview}`].filter(Boolean).join(""));
       }
-
-      // Apply edits
-      const applyResult = applyEdits(normalized, resolvedEdits);
-      const resultText = restoreLineEndings(applyResult.text, eol);
-      const persisted = bom + resultText;
-      await writeFile(absolute, persisted, "utf8");
-
-      const newHash = await computeFileHash(applyResult.text);
-      await snapshotStore.record(absolute, applyResult.text);
-      const header = formatHashlineHeader(filePath, newHash);
-      const diffPreview = buildCompactDiffPreview(
-        normalized,
-        applyResult.text,
-        { contextLines: 3, maxLines: 60 },
-      );
-      const allWarnings: string[] = [...blockWarnings, ...(applyResult.warnings ?? []), ...parseWarnings];
 
       return {
-        content: [{
-          type: "text",
-          text: [header, allWarnings.length > 0 ? `\nWarnings:\n${allWarnings.join("\n")}` : "", `\n${diffPreview.preview}`].filter(Boolean).join(""),
-        }],
+        content: [{ type: "text", text: contentParts.join("\n\n") }],
         details: {
-          path: filePath, edits: edits.length, fileHash: newHash,
-          anchorRange: applyResult.firstChangedLine ? { start: applyResult.firstChangedLine, end: findChangedEnd(applyResult.text, normalized) } : undefined,
-          displayDiff: diffPreview.preview, warnings: allWarnings,
+          path: firstPath ?? params.path,
+          sections: result.sections.length,
+          fileHash: firstFileHash,
+          displayDiff: firstDisplayDiff,
+          warnings: allWarnings,
         },
       };
     },
@@ -227,7 +168,7 @@ export function registerEditTool(pi: ExtensionAPI) {
       const component = context.state.callComponent as any;
       if (component) {
         component.clear();
-        const path = context.args?.path || "...";
+        const path = context.args?.path || (context.args?.diff ? String(context.args.diff).split("\n")[0] : "...");
         component.addChild(new Text(`${theme.fg("toolTitle", theme.bold("edit#"))} ${theme.fg("accent", path)}`, 0, 0));
         if (context.state.errorText) { component.addChild(new Spacer(1)); component.addChild(new Text(theme.fg("error", context.state.errorText), 0, 0)); }
         if (context.state.displayDiff) { component.addChild(new Spacer(1)); component.addChild(new Text(theme.fg("toolOutput", context.state.displayDiff), 0, 0)); }
@@ -235,22 +176,4 @@ export function registerEditTool(pi: ExtensionAPI) {
       return new Container();
     },
   });
-}
-
-function extractAnchorLines(edits: any[]): number[] {
-  const lines: number[] = [];
-  for (const edit of edits) {
-    if (edit.kind === "delete") lines.push(edit.anchor.line);
-    if (edit.kind === "insert" && (edit.cursor?.kind === "before_anchor" || edit.cursor?.kind === "after_anchor")) lines.push(edit.cursor.anchor.line);
-  }
-  return lines;
-}
-
-function findChangedEnd(after: string, before: string): number {
-  const afterLines = after.split("\n");
-  const beforeLines = before.split("\n");
-  for (let i = Math.max(afterLines.length, beforeLines.length) - 1; i >= 0; i--) {
-    if (afterLines[i] !== beforeLines[i]) return i + 1;
-  }
-  return Math.max(afterLines.length, beforeLines.length);
 }

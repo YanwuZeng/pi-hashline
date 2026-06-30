@@ -12,6 +12,8 @@ export interface Snapshot {
 export abstract class SnapshotStore {
   abstract head(path: string): Snapshot | null;
   abstract byHash(path: string, hash: string): Snapshot | null;
+  /** All recorded snapshots for `path` in record order (oldest first). */
+  abstract versions(path: string): readonly Snapshot[];
   abstract record(path: string, fullText: string, seenLines?: Iterable<number>): Promise<string>;
   abstract recordSeenLines(path: string, hash: string, lines: Iterable<number>): void;
   abstract invalidate(path: string): void;
@@ -42,6 +44,10 @@ export class InMemorySnapshotStore extends SnapshotStore {
     const versions = this.cache.get(path);
     if (!versions) return null;
     return versions.find(v => v.hash === hash) ?? null;
+  }
+  versions(path: string): readonly Snapshot[] {
+    const versions = this.cache.get(path);
+    return versions ? [...versions] : [];
   }
 
   async record(path: string, fullText: string, seenLines?: Iterable<number>): Promise<string> {

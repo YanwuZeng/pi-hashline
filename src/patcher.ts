@@ -48,6 +48,7 @@ export class PreparedSection {
     readonly normalized: string,
     readonly applyResult: ApplyResult,
     readonly parseWarnings: readonly string[],
+    readonly blockWarnings: readonly string[] = [],
   ) {}
 
   get isNoop(): boolean {
@@ -75,16 +76,19 @@ export class Patcher {
   }
 
   async apply(patch: Patch): Promise<PatcherApplyResult> {
-    const results: PatchSectionResult[] = [];
-
+    // All-or-nothing: prepare every section in memory first. If any section
+    // fails to prepare (hash mismatch, unseen lines, parse error, unresolved
+    // block, ...), no disk write happens for any section.
+    const prepared: PreparedSection[] = [];
     for (const section of patch.sections) {
-      const prepared = await this.prepare(section);
-      if (!prepared.isNoop) {
-        const commitResult = await this.commit(prepared);
-        results.push(commitResult);
-      } else {
-        results.push(this.noopResult(prepared));
-      }
+      prepared.push(await this.prepare(section));
+    }
+
+    const results: PatchSectionResult[] = [];
+    for (const preparedSection of prepared) {
+      results.push(
+        preparedSection.isNoop ? this.noopResult(preparedSection) : await this.commit(preparedSection),
+      );
     }
 
     return { sections: results };
@@ -111,33 +115,60 @@ export class Patcher {
     const lineEnding = detectLineEnding(bomStripped);
     const normalized = normalizeToLF(bomStripped);
 
-    // Validate snapshot tag
+    // Parse once and reuse the edits for tag validation, recovery, and apply.
+    const { edits: parsedEdits, warnings: parseWarnings } = parsePatch(section.text);
+
+    // Resolve block edits up front so both recovery and apply see concrete edits.
+    const blockWarnings: string[] = [];
+    const edits = resolveBlockEdits(parsedEdits, normalized, canonicalPath, this.blockResolver, {
+      onWarning: (msg: string) => { blockWarnings.push(msg); },
+    });
+
+    // Validate snapshot tag.
     if (section.fileHash) {
       const liveHash = await computeFileHash(normalized);
       const snapshot = this.snapshots.byHash(canonicalPath, section.fileHash);
 
       if (liveHash !== section.fileHash) {
+        // Head/tail-only inserts are position-stable: a stale tag is non-fatal.
+        if (!hasAnchorScopedEdit(edits)) {
+          const applyResult = applyEdits(normalized, edits);
+          return new PreparedSection(
+            section, canonicalPath, exists, rawContent, bom, lineEnding,
+            normalized,
+            {
+              text: applyResult.text,
+              firstChangedLine: applyResult.firstChangedLine,
+              warnings: [HEADTAIL_DRIFT_WARNING, ...(applyResult.warnings ?? [])],
+            },
+            parseWarnings,
+            blockWarnings,
+          );
+        }
+
+        // File drifted: try to replay against the tagged snapshot, then 3-way-merge.
         if (snapshot) {
-          // Try recovery
           try {
-            const edits = this.parseSectionEdits(section);
             const recovered = await this.tryRecover(canonicalPath, normalized, section.fileHash, edits);
             if (recovered) {
               return new PreparedSection(
                 section, canonicalPath, exists, rawContent, bom, lineEnding,
                 normalized,
-                { text: recovered.text, firstChangedLine: recovered.firstChangedLine, warnings: recovered.warnings },
-                [],
+                {
+                  text: recovered.text,
+                  firstChangedLine: recovered.firstChangedLine,
+                  warnings: recovered.warnings,
+                },
+                parseWarnings,
+                blockWarnings,
               );
             }
           } catch {
-            // Recovery failed, fall through to error
+            // Recovery failed, fall through to the mismatch error.
           }
         }
 
-        const anchorEdits = this.parseSectionEdits(section);
-        const anchorLines = extractAnchorLines(anchorEdits);
-
+        const anchorLines = extractAnchorLines(edits);
         throw new MismatchError({
           path: canonicalPath,
           expectedFileHash: section.fileHash,
@@ -148,33 +179,27 @@ export class Patcher {
         });
       }
 
-      // Check unseen lines
-      if (snapshot?.seenLines && hasAnchorScopedEdit(this.parseSectionEdits(section))) {
-        this.checkUnseenLines(section, canonicalPath, snapshot.seenLines);
+      // Tag matches. Reject edits anchored on lines the model never displayed.
+      if (snapshot?.seenLines && hasAnchorScopedEdit(edits)) {
+        this.checkUnseenLines(section, canonicalPath, snapshot.seenLines, edits);
       }
     } else {
-      // Missing tag - warn but allow head/tail inserts
-      const edits = this.parseSectionEdits(section);
+      // No tag: allow only position-stable head/tail inserts.
       const hasHeadTailOnly = edits.length > 0 && edits.every(
-        e => (e.kind === "insert" && (e.cursor.kind === "bof" || e.cursor.kind === "eof")) || e.kind === "block",
+        (e: Edit) =>
+          (e.kind === "insert" && (e.cursor.kind === "bof" || e.cursor.kind === "eof")) ||
+          e.kind === "block",
       );
       if (!hasHeadTailOnly) {
         throw new Error(missingSnapshotTagMessage(section.rawPath));
       }
     }
 
-    // Parse and resolve edits
-    let edits = this.parseSectionEdits(section);
-    edits = resolveBlockEdits(edits, normalized, canonicalPath, this.blockResolver, {
-      onWarning: (msg) => { /* warnings collected later */ },
-    });
-
-    // Apply
     const applyResult = applyEdits(normalized, edits);
 
     return new PreparedSection(
       section, canonicalPath, exists, rawContent, bom, lineEnding,
-      normalized, applyResult, [],
+      normalized, applyResult, parseWarnings, blockWarnings,
     );
   }
 
@@ -208,7 +233,7 @@ export class Patcher {
       fileHash,
       header,
       firstChangedLine: applyResult.firstChangedLine,
-      warnings: [...(applyResult.warnings ?? [])],
+      warnings: [...(applyResult.warnings ?? []), ...prepared.blockWarnings],
       blockResolutions: applyResult.blockResolutions,
     };
   }
@@ -228,11 +253,6 @@ export class Patcher {
     };
   }
 
-  private parseSectionEdits(section: PatchSection): Edit[] {
-    const result = parsePatch(section.text);
-    return result.edits;
-  }
-
   private async tryRecover(
     path: string,
     currentText: string,
@@ -247,8 +267,8 @@ export class Patcher {
     section: PatchSection,
     canonicalPath: string,
     seenLines: Set<number>,
+    edits: readonly Edit[],
   ): void {
-    const edits = this.parseSectionEdits(section);
     const unseen: number[] = [];
 
     for (const edit of edits) {

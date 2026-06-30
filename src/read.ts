@@ -13,7 +13,7 @@ import {
   splitLines,
   stripHashlinePrefixesForDisplay,
 } from "./shared.ts";
-import { formatHashlineHeader, formatNumberedLine, HL_FILE_HASH_LENGTH } from "./format.ts";
+import { formatHashlineHeader, formatNumberedLine } from "./format.ts";
 import { InMemorySnapshotStore, SnapshotStore } from "./snapshots.ts";
 
 const readSchema = Type.Object({
@@ -76,11 +76,10 @@ export function registerReadTool(pi: ExtensionAPI) {
         bytes = nextBytes;
       }
 
-      await snapshotStore.record(absolute, text, seenLines);
-      const fileHash = await snapshotStore.byHash(absolute, (await snapshotStore.record(absolute, text, seenLines)));
+      const fileHash = await snapshotStore.record(absolute, text, seenLines);
 
       const end = start + selected.length;
-      const header = formatHashlineHeader(path, fileHash?.hash ?? "????");
+      const header = formatHashlineHeader(path, fileHash ?? "????");
       let output = `${header}\n${selected.join("\n")}`;
 
       if (end < lines.length) {

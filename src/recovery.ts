@@ -90,24 +90,20 @@ export function recover(
   );
   if (chainResult) return chainResult;
 
-  // Try replay: walk the version chain for this path
-  let version = store.head(path);
-  const visited = new Set<string>();
-  while (version && !visited.has(version.hash)) {
-    visited.add(version.hash);
-    if (version.hash !== fileHash && version.text !== currentText) {
-      const replayResult = applyEditsToSnapshot(
-        version.text,
-        currentText,
-        edits,
-        RECOVERY_SESSION_REPLAY_WARNING,
-      );
-      if (replayResult) return replayResult;
-    }
-    // Walk backwards through history
-    const prevHash = version.hash;
-    version = store.byHash(path, prevHash); // same version, need previous
-    break; // simplistic: one level is enough for most cases
+  // Try replay: walk every historical version for this path, replaying the
+  // edits onto that older content and 3-way-merging onto the live file. Skip
+  // the chain base (fileHash, already tried above) and any version whose text
+  // matches the live content (nothing to merge).
+  for (const version of store.versions(path)) {
+    if (version.hash === fileHash) continue;
+    if (version.text === currentText) continue;
+    const replayResult = applyEditsToSnapshot(
+      version.text,
+      currentText,
+      edits,
+      RECOVERY_SESSION_REPLAY_WARNING,
+    );
+    if (replayResult) return replayResult;
   }
 
   return null;

@@ -185,6 +185,38 @@ function mergeConsecutiveOps(ops: AtomicOp[]): AtomicOp[] {
   return merged;
 }
 
+/**
+ * Self-heal replacement boundaries. A common model mistake is to restate the
+ * unchanged structural closer that sits immediately AFTER a replaced range as
+ * the last body row of a `SWAP N.=M:`. Keeping it would duplicate that closer.
+ * When the last payload line exactly equals the line just past the range AND
+ * that line is a structural closer, drop the duplicate and warn.
+ *
+ * Conservative by design: it only fires on an exact (whitespace-sensitive)
+ * match with a structural closer, so intentionally repeated statements and
+ * differently-indented nested closers are left intact.
+ */
+function repairReplacementBoundaries(
+  ops: AtomicOp[],
+  fileLines: readonly string[],
+): { ops: AtomicOp[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const repaired = ops.map((op) => {
+    if (op.kind !== "replace" || op.deleteCount === 0 || op.payload.length === 0) return op;
+    const afterIdx = op.anchorLine - 1 + op.deleteCount; // 0-indexed line immediately after the range
+    const afterLine = fileLines[afterIdx];
+    if (afterLine === undefined) return op;
+    const lastPayload = op.payload[op.payload.length - 1];
+    if (lastPayload !== afterLine) return op;
+    if (!STRUCTURAL_CLOSER_RE.test(afterLine.trim())) return op;
+    warnings.push(
+      `SWAP ${op.anchorLine}.=${op.anchorLine + op.deleteCount - 1}: dropped a trailing body row that duplicated the unchanged closing line ${op.anchorLine + op.deleteCount} ("${afterLine.trim()}"). Keep only the lines that change; the range already excludes the line after it.`,
+    );
+    return { ...op, payload: op.payload.slice(0, -1) };
+  });
+  return { ops: repaired, warnings };
+}
+
 // ── Main apply function ────────────────────────────────────────────────────
 
 export function applyEdits(oldText: string, edits: readonly Edit[]): ApplyResult {
@@ -193,6 +225,14 @@ export function applyEdits(oldText: string, edits: readonly Edit[]): ApplyResult
 
   // Step 2: Merge consecutive same-anchor insert ops (batch payloads)
   ops = mergeConsecutiveOps(ops);
+
+  const warnings: string[] = [];
+  let fileLines = oldText.split("\n");
+
+  // Step 2b: Self-heal replacement boundaries (drop duplicated trailing closers).
+  const repair = repairReplacementBoundaries(ops, fileLines);
+  ops = repair.ops;
+  if (repair.warnings.length > 0) warnings.push(...repair.warnings);
 
   // Step 3: Sort operations bottom-up (descending anchorLine) with stable tiebreaker.
   // Bottom-up processing prevents line-number drift: edits at higher line numbers
@@ -203,9 +243,6 @@ export function applyEdits(oldText: string, edits: readonly Edit[]): ApplyResult
   });
 
   // Step 4: Apply each operation against the file
-  const warnings: string[] = [];
-  let fileLines = oldText.split("\n");
-
   for (const op of ops) {
     switch (op.kind) {
       case "replace": {

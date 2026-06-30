@@ -47,11 +47,14 @@ function tryParseRecoveryHeader(line: string, cwd?: string): RawSection | null {
   if (pathText.includes("#")) return null;
   pathText = unquoteHashlinePath(pathText);
 
+  // Keep the model-facing path text (rawPath) separate from the canonical,
+  // resolved absolute path used for filesystem access.
   const cleanPath = cwd ? path.resolve(cwd, pathText) : pathText;
-  return { path: cleanPath, fileHash };
+  return { rawPath: pathText, path: cleanPath, fileHash };
 }
 
 export interface RawSection {
+  rawPath: string;
   path: string;
   fileHash?: string;
 }
@@ -78,7 +81,7 @@ export function splitPatchInput(input: string, options?: SplitOptions): { sectio
     if (rawHeader) {
       if (currentSection) {
         sections.push({
-          rawPath: currentSection.header.path,
+          rawPath: currentSection.header.rawPath,
           resolvedPath: currentSection.header.path,
           fileHash: currentSection.header.fileHash,
           text: currentSection.textLines.join("\n"),
@@ -101,7 +104,7 @@ export function splitPatchInput(input: string, options?: SplitOptions): { sectio
   // Flush last section
   if (currentSection) {
     sections.push({
-      rawPath: currentSection.header.path,
+      rawPath: currentSection.header.rawPath,
       resolvedPath: currentSection.header.path,
       fileHash: currentSection.header.fileHash,
       text: currentSection.textLines.join("\n"),
